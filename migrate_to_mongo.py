@@ -1,29 +1,29 @@
 
 #!/usr/bin/env python3
 """
-MongoDB CSV Migration Script (Healthcare dataset)
--------------------------------------------------
-- Reads a CSV export of patient records and migrates them into MongoDB.
-- Applies light transformations (normalizes names to lowercase, coerces types,
-  parses dates) and inserts documents in batches.
+MongoDB CSV Migration Script (Healthcare dataset) — Upsert & Unique Index
+-------------------------------------------------------------------------
+Adds:
+  - Case-normalization for *all* natural key fields (name, gender, blood_type, hospital).
+  - Date normalization to date-only (00:00:00) for admission/discharge.
+  - Unique compound index on (name, gender, blood_type, date_of_admission, hospital).
+  - Idempotent bulk upserts (no duplicates on reruns).
+  - Optional .env support.
+
+Natural key (per your spec): (name, gender, blood_type, date_of_admission, hospital)
 
 Usage (examples):
-  python migrate_to_mongo.py --csv /path/healthcare_dataset.csv \\
-    --mongo-uri "mongodb://localhost:27017" --db healthcare --collection patients
+  # One-time: create index and upsert
+  python migrate_to_mongo.py --csv /path/healthcare_dataset.csv --create-indexes --upsert
 
-  # Dry-run to preview the first transformed records without inserting:
+  # Preview only
   python migrate_to_mongo.py --csv /path/healthcare_dataset.csv --dry-run
 
-  # Print requirements (helpful for generating requirements.txt):
-  python migrate_to_mongo.py --print-requirements
+  # Plain insert (no upsert)
+  python migrate_to_mongo.py --csv /path/healthcare_dataset.csv --no-upsert
 
-Notes:
-  * The script expects the following exact CSV columns (case-sensitive):
-    ['Name','Age','Gender','Blood Type','Medical Condition','Date of Admission',
-     'Doctor','Hospital','Insurance Provider','Billing Amount','Room Number',
-     'Admission Type','Discharge Date','Medication','Test Results']
-  * MongoDB _id is auto-generated per document.
-  * Dates are parsed with day-first format enabled (common in EU datasets).
+  # Print requirements
+  python migrate_to_mongo.py --print-requirements
 
 """
 import argparse
@@ -33,19 +33,22 @@ import logging
 from typing import Dict, Iterable, List, Optional
 from datetime import datetime
 
+# Optional .env support (won't fail if not installed)
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
+
 import pandas as pd
 from pymongo import MongoClient, UpdateOne
 from pymongo.errors import BulkWriteError
 
-# ------------------------------
-# Requirements helper
-# ------------------------------
 __REQUIREMENTS__ = [
     "pandas>=2.0,<3",
     "pymongo>=4.6,<5",
     "python-dotenv>=1.0,<2",
 ]
-
 
 EXPECTED_COLUMNS = [
     "Name",
@@ -65,16 +68,16 @@ EXPECTED_COLUMNS = [
     "Test Results",
 ]
 
-# Optional: load variables from a .env file in the working directory
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    # python-dotenv not installed or no .env file — safe to ignore
-    pass
+NATURAL_KEY_FIELDS = [  # normalized field names used in Mongo
+    "name",
+    "gender",
+    "blood_type",
+    "date_of_admission",
+    "hospital",
+]
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Migrate healthcare CSV into MongoDB.")
+    parser = argparse.ArgumentParser(description="Migrate healthcare CSV into MongoDB with idempotent upserts.")
     parser.add_argument("--csv", dest="csv_path", required=False,
                         default=os.environ.get("CSV_PATH"),
                         help="Path to the input CSV file (or env CSV_PATH).")
@@ -88,11 +91,11 @@ def parse_args() -> argparse.Namespace:
                         default=os.environ.get("MONGO_COLLECTION", "patients"),
                         help="Mongo collection name (or env MONGO_COLLECTION).")
     parser.add_argument("--batch-size", dest="batch_size", type=int, default=1000,
-                        help="Batch size for bulk inserts.")
-    parser.add_argument("--dry-run", dest="dry_run", action="store_true",
-                        help="Validate and transform, but do not insert into MongoDB.")
+                        help="Batch size for bulk operations.")
     parser.add_argument("--chunksize", dest="chunksize", type=int, default=5000,
                         help="Read the CSV in chunks of this many rows (streaming).")
+    parser.add_argument("--dry-run", dest="dry_run", action="store_true",
+                        help="Validate and transform, but do not write to MongoDB.")
     parser.add_argument("--print-requirements", action="store_true",
                         help="Print pip requirements and exit.")
     parser.add_argument("--create-indexes", dest="create_indexes", action="store_true",
@@ -103,18 +106,15 @@ def parse_args() -> argparse.Namespace:
                               help="Use upsert mode (default).")
     upsert_group.add_argument("--no-upsert", dest="upsert", action="store_false",
                               help="Disable upsert; perform plain inserts.")
-    
     parser.add_argument("--log-level", dest="log_level", default=os.environ.get("LOG_LEVEL","INFO"),
                         help="Logging level (DEBUG, INFO, WARNING, ERROR).")
     return parser.parse_args()
-
 
 def setup_logging(level: str) -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
-
 
 def validate_columns(columns: List[str]) -> None:
     missing = [c for c in EXPECTED_COLUMNS if c not in columns]
@@ -123,17 +123,6 @@ def validate_columns(columns: List[str]) -> None:
         raise ValueError(f"Missing expected columns: {missing}")
     if extra:
         logging.warning("Extra columns present and will be ignored: %s", extra)
-
-
-def coerce_string(val) -> Optional[str]:
-    if pd.isna(val):
-        return None
-    s = str(val).strip()
-    return s if s != "" else None
-
-def normalize_lower(val) -> Optional[str]:
-    s = coerce_string(val)
-    return s.lower() if s else None
 
 def coerce_string(val) -> Optional[str]:
     if pd.isna(val):
@@ -173,8 +162,7 @@ def coerce_date(val) -> Optional[datetime]:
     py = dt.to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=None)
     return py
 
-
-def transform_row(row: pd.Series) -> Dict:
+def transform_row(row: pd.Series) -> Optional[Dict]:
     """Map CSV row to MongoDB document with normalized types/case.
        Returns None if the natural-key fields are missing (skips row)."""
     name = normalize_lower(row.get("Name"))
@@ -214,7 +202,6 @@ def transform_row(row: pd.Series) -> Dict:
     }
     return doc
 
-
 def iter_documents(csv_path: str, chunksize: int) -> Iterable[List[Dict]]:
     first = True
     for chunk in pd.read_csv(csv_path, chunksize=chunksize):
@@ -228,7 +215,6 @@ def iter_documents(csv_path: str, chunksize: int) -> Iterable[List[Dict]]:
                 docs.append(d)
         if docs:
             yield docs
-
 
 def get_collection(mongo_uri: str, db_name: str, collection_name: str):
     client = MongoClient(mongo_uri)
@@ -275,7 +261,7 @@ def bulk_write(collection, docs: List[Dict], upsert: bool) -> int:
     except BulkWriteError as bwe:
         logging.error("Bulk write error (upsert): %s", bwe.details)
         return 0
-    
+
 def insert_or_upsert(collection, docs_iter: Iterable[List[Dict]], batch_size: int, upsert: bool) -> int:
     total = 0
     buffer: List[Dict] = []
@@ -305,20 +291,15 @@ def main():
     docs_iter = iter_documents(args.csv_path, chunksize=args.chunksize)
 
     if args.dry_run:
-        # Materialize first few documents for preview
         try:
             first_batch = next(docs_iter)
         except StopIteration:
             logging.warning("CSV appears empty; nothing to preview.")
             sys.exit(0)
         preview = first_batch[:5]
-        logging.info("Previewing %d transformed documents (dry-run):", len(preview))
-        # Pretty print
         import json
         print(json.dumps(preview, default=str, indent=2))
         sys.exit(0)
-
-    logging.info("Connecting to MongoDB: %s | db=%s | collection=%s", args.mongo_uri, args.db_name, args.collection_name)
 
     collection = get_collection(args.mongo_uri, args.db_name, args.collection_name)
 
@@ -328,7 +309,6 @@ def main():
     logging.info("Mode: %s", "UPSERT" if args.upsert else "INSERT")
     written = insert_or_upsert(collection, docs_iter, batch_size=args.batch_size, upsert=args.upsert)
     logging.info("Written %d documents into %s.%s", written, args.db_name, args.collection_name)
-
 
 if __name__ == "__main__":
     main()
