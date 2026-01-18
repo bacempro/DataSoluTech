@@ -30,7 +30,7 @@ import argparse
 import os
 import sys
 import logging
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 from datetime import datetime
 
 # Optional .env support (won't fail if not installed)
@@ -106,6 +106,8 @@ def parse_args() -> argparse.Namespace:
                               help="Use upsert mode (default).")
     upsert_group.add_argument("--no-upsert", dest="upsert", action="store_false",
                               help="Disable upsert; perform plain inserts.")
+    parser.add_argument("--report-path",dest="report_path",default=os.environ.get("REPORT_PATH"),
+                        help="Path for report.txt",)
     parser.add_argument("--log-level", dest="log_level", default=os.environ.get("LOG_LEVEL","INFO"),
                         help="Logging level (DEBUG, INFO, WARNING, ERROR).")
     return parser.parse_args()
@@ -202,7 +204,10 @@ def transform_row(row: pd.Series) -> Optional[Dict]:
     }
     return doc
 
-def iter_documents(csv_path: str, chunksize: int) -> Iterable[List[Dict]]:
+def natural_key_tuple(doc: Dict) -> Tuple:
+    return (doc["name"], doc["gender"], doc["blood_type"], doc["date_of_admission"], doc["hospital"])
+
+def iter_documents(csv_path: str, chunksize: int, stats: Dict) -> Iterable[List[Dict]]:
     first = True
     for chunk in pd.read_csv(csv_path, chunksize=chunksize):
         if first:
@@ -210,9 +215,18 @@ def iter_documents(csv_path: str, chunksize: int) -> Iterable[List[Dict]]:
             first = False
         docs = []
         for _, row in chunk.iterrows():
+            stats["total_rows"] += 1
             d = transform_row(row)
-            if d is not None:
-                docs.append(d)
+            if d is None:
+                stats["missing_key_rows"] += 1
+                continue
+            key = natural_key_tuple(d)
+            if key in stats["seen_keys"]:
+                stats["duplicate_key_rows"] += 1
+                # Skip duplicates to avoid redundant upserts in this run
+                continue
+            stats["seen_keys"].add(key)
+            docs.append(d)
         if docs:
             yield docs
 
@@ -275,6 +289,20 @@ def insert_or_upsert(collection, docs_iter: Iterable[List[Dict]], batch_size: in
         total += bulk_write(collection, buffer, upsert=upsert)
     return total
 
+def append_report(report_path: str, csv_path: str, stats: Dict, written: int) -> None:
+    ts = datetime.utcnow().isoformat(timespec="seconds") + "Z"
+    line = (
+        f"[{ts}] csv={os.path.basename(csv_path)} "
+        f"total_rows={stats['total_rows']} "
+        f"duplicates_in_csv={stats['duplicate_key_rows']} "
+        f"missing_key_rows={stats['missing_key_rows']} "
+        f"upserted_or_modified={written}\n"
+    )
+    os.makedirs(os.path.dirname(report_path), exist_ok=True)
+    with open(report_path, "a", encoding="utf-8") as f:
+        f.write(line)
+    logging.info("Appended report entry to %s", report_path)
+
 def main():
     args = parse_args()
     setup_logging(args.log_level)
@@ -288,7 +316,15 @@ def main():
         sys.exit(2)
 
     logging.info("Reading CSV from: %s", args.csv_path)
-    docs_iter = iter_documents(args.csv_path, chunksize=args.chunksize)
+
+    stats = {
+        "total_rows": 0,
+        "missing_key_rows": 0,
+        "duplicate_key_rows": 0,
+        "seen_keys": set(),  # Set[Tuple]
+    }
+
+    docs_iter = iter_documents(args.csv_path, chunksize=args.chunksize, stats=stats)
 
     if args.dry_run:
         try:
@@ -308,6 +344,7 @@ def main():
 
     logging.info("Mode: %s", "UPSERT" if args.upsert else "INSERT")
     written = insert_or_upsert(collection, docs_iter, batch_size=args.batch_size, upsert=args.upsert)
+    append_report(args.report_path, args.csv_path, stats, written)
     logging.info("Written %d documents into %s.%s", written, args.db_name, args.collection_name)
 
 if __name__ == "__main__":
